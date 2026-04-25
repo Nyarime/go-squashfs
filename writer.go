@@ -232,18 +232,24 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		node.dirSize = uint32(dirBuf.Len()) - node.dirStart
 	}
 
-	// Phase 3: Build inode table
-	// SquashFS convention: write children before parents (root last)
+	// Phase 3: Build inode table (depth-first: leaves before parents)
 	var inodeBuf bytes.Buffer
-	// Write non-root first
-	for _, node := range allNodes {
-		if node == root { continue }
-		node.inodeOff = inodeBuf.Len()
-		w.writeNodeInode(&inodeBuf, node)
+	var writeOrder func(n *wNode)
+	writeOrder = func(n *wNode) {
+		// Write children first (sorted), then self
+		for _, child := range n.children {
+			if child.isDir {
+				writeOrder(child)
+			} else {
+				child.inodeOff = inodeBuf.Len()
+				w.writeNodeInode(&inodeBuf, child)
+			}
+		}
+		// Write self (directory) after all children
+		n.inodeOff = inodeBuf.Len()
+		w.writeNodeInode(&inodeBuf, n)
 	}
-	// Write root last
-	root.inodeOff = inodeBuf.Len()
-	w.writeNodeInode(&inodeBuf, root)
+	writeOrder(root)
 
 	// Patch dir entries with correct inode offsets
 	dirBytes := dirBuf.Bytes()
@@ -340,10 +346,12 @@ func (w *Writer) writeNodeInode(buf *bytes.Buffer, node *wNode) {
 		if node.parent != nil {
 			parentNum = node.parent.inodeNum
 		}
-		binary.Write(buf, binary.LittleEndian, node.dirStart) // dir start
+		// dir_start = compressed metablock offset from DirTableStart (0 for single metablock)
+		// offset = decompressed byte offset within that metablock
+		binary.Write(buf, binary.LittleEndian, uint32(0))            // dir_start (single metablock)
 		binary.Write(buf, binary.LittleEndian, nlinks)
 		binary.Write(buf, binary.LittleEndian, uint16(node.dirSize)) // file_size - 3
-		binary.Write(buf, binary.LittleEndian, uint16(0))            // offset
+		binary.Write(buf, binary.LittleEndian, uint16(node.dirStart)) // offset within metablock
 		binary.Write(buf, binary.LittleEndian, parentNum)
 
 	case node.isLink:
