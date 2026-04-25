@@ -473,18 +473,18 @@ func (r *Reader) ExtractTo(outDir string) (int, error) {
 	}
 
 	count := 0
-	err = r.extractDir(outDir, rootInode, &count, 0)
+	visited := make(map[uint64]bool) // inode ref dedup
+	err = r.extractDir(outDir, rootInode, &count, 0, visited)
 	return count, err
 }
 
-func (r *Reader) extractDir(path string, in Inode, count *int, depth int) error {
+func (r *Reader) extractDir(path string, in Inode, count *int, depth int, visited map[uint64]bool) error {
 	if depth > 15 {
-		return nil // prevent deep recursion
+		return nil
 	}
 	if *count > 100000 {
 		return fmt.Errorf("extraction limit reached (100000 files) - possible circular reference")
 	}
-	// Path length check to catch recursive loops early
 	if len(path) > 4096 {
 		return nil
 	}
@@ -499,16 +499,23 @@ func (r *Reader) extractDir(path string, in Inode, count *int, depth int) error 
 		if e.Name == "." || e.Name == ".." {
 			continue
 		}
+
+		// CRITICAL: inode dedup — prevent infinite recursion from bad cross-refs
+		if visited[e.InodeRef] {
+			continue
+		}
+		visited[e.InodeRef] = true
+
 		fullPath := filepath.Join(path, e.Name)
 
 		childInode, err := r.readInode(e.InodeRef)
 		if err != nil {
-			continue // skip bad inodes
+			continue
 		}
 
 		switch childInode.Type {
 		case InodeBasicDir, InodeExtDir:
-			r.extractDir(fullPath, childInode, count, depth+1)
+			r.extractDir(fullPath, childInode, count, depth+1, visited)
 
 		case InodeBasicFile, InodeExtFile:
 			data, err := r.readFileData(childInode)
