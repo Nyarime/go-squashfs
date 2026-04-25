@@ -228,39 +228,24 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		out.Write(compressed)
 	}
 
-	// Phase 2: Build inode table
-	inodeTableStart := uint64(out.Len())
-	var inodeTable bytes.Buffer
-	inodeOffsets := make(map[uint32]uint64) // inodeNum → offset in inodeTable
-
-	for _, node := range allNodes {
-		inodeOffsets[node.inodeNum] = uint64(inodeTable.Len())
-		w.writeInode(&inodeTable, node)
-	}
-
-	// Write inode table as metablocks
-	w.writeMetablocks(out, inodeTable.Bytes())
-
-	// Phase 3: Build directory table
-	dirTableStart := uint64(out.Len())
+	// Phase 2: Build directory table (in memory first, to get offsets)
 	var dirTable bytes.Buffer
-	dirOffsets := make(map[uint32][2]uint32) // inodeNum → [start, offset]
-
+	
 	for _, node := range allNodes {
 		if !node.isDir || len(node.children) == 0 {
 			continue
 		}
+		
 		dirStart := uint32(dirTable.Len())
+		
 		// Write dir header
 		count := uint32(len(node.children) - 1)
 		binary.Write(&dirTable, binary.LittleEndian, count)
-		// Start block (byte offset of first child's inode metablock)
-		binary.Write(&dirTable, binary.LittleEndian, uint32(0)) // simplified
+		binary.Write(&dirTable, binary.LittleEndian, uint32(0)) // inode block start (simplified)
 		binary.Write(&dirTable, binary.LittleEndian, node.children[0].inodeNum)
 
 		for _, child := range node.children {
-			// Entry: offset(2) + inode_delta(2) + type(2) + name_size(2) + name
-			childOff := uint16(inodeOffsets[child.inodeNum] & 0xFFFF)
+			childOff := uint16(0) // will be set later
 			binary.Write(&dirTable, binary.LittleEndian, childOff)
 			binary.Write(&dirTable, binary.LittleEndian, int16(int32(child.inodeNum)-int32(node.children[0].inodeNum)))
 			entType := uint16(InodeBasicFile)
@@ -274,13 +259,28 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 			binary.Write(&dirTable, binary.LittleEndian, uint16(len(name)-1))
 			dirTable.WriteString(name)
 		}
-
-		dirOffsets[node.inodeNum] = [2]uint32{dirStart, 0}
+		
+		dirEnd := uint32(dirTable.Len())
+		// Set dir info on the node for inode writing
+		node.fragIndex = dirStart  // reuse fragIndex temporarily for dirStart
+		node.fragOffset = dirEnd - dirStart  // reuse for dirSize
 	}
 
+	// Phase 3: Build inode table
+	inodeTableStart := uint64(out.Len())
+	var inodeTable bytes.Buffer
+
+	for _, node := range allNodes {
+		w.writeInode(&inodeTable, node, allNodes)
+	}
+
+	w.writeMetablocks(out, inodeTable.Bytes())
+
+	// Phase 3b: Write directory table
+	dirTableStart := uint64(out.Len())
 	w.writeMetablocks(out, dirTable.Bytes())
 
-	// Phase 4: Fragment table
+// Phase 4: Fragment table
 	fragTableStart := uint64(out.Len())
 	if len(fragEntries) > 0 {
 		var fragData bytes.Buffer
@@ -334,7 +334,7 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 	return os.WriteFile(outputPath, out.Bytes(), 0644)
 }
 
-func (w *Writer) writeInode(buf *bytes.Buffer, node *writerNode) {
+func (w *Writer) writeInode(buf *bytes.Buffer, node *writerNode, allNodes []*writerNode) {
 	// Common header: type(2) + perm(2) + uid(2) + gid(2) + mtime(4) + number(4)
 	inodeType := uint16(InodeBasicFile)
 	if node.isDir {
@@ -353,9 +353,9 @@ func (w *Writer) writeInode(buf *bytes.Buffer, node *writerNode) {
 	switch {
 	case node.isDir:
 		// BasicDir: start_block(4) + nlinks(4) + file_size(2) + offset(2) + parent(4)
-		binary.Write(buf, binary.LittleEndian, uint32(0))              // dir start
+		binary.Write(buf, binary.LittleEndian, node.fragIndex) // dir start (stored in fragIndex)
 		binary.Write(buf, binary.LittleEndian, uint32(len(node.children)+2)) // nlinks
-		binary.Write(buf, binary.LittleEndian, uint16(0))              // dir size (placeholder)
+		binary.Write(buf, binary.LittleEndian, uint16(node.fragOffset)) // dir size
 		binary.Write(buf, binary.LittleEndian, uint16(0))              // offset
 		binary.Write(buf, binary.LittleEndian, uint32(1))              // parent
 
