@@ -478,8 +478,15 @@ func (r *Reader) ExtractTo(outDir string) (int, error) {
 }
 
 func (r *Reader) extractDir(path string, in Inode, count *int, depth int) error {
-	if depth > 20 {
-		return nil // prevent infinite recursion
+	if depth > 15 {
+		return nil // prevent deep recursion
+	}
+	if *count > 100000 {
+		return fmt.Errorf("extraction limit reached (100000 files) - possible circular reference")
+	}
+	// Path length check to catch recursive loops early
+	if len(path) > 4096 {
+		return nil
 	}
 	os.MkdirAll(path, 0755)
 
