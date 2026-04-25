@@ -6,6 +6,7 @@ package squashfs
 import (
 	"bytes"
 	"compress/gzip"
+	"compress/zlib"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -181,12 +182,19 @@ func (r *Reader) String() string {
 func (r *Reader) Decompress(compressed []byte) ([]byte, error) {
 	switch r.SB.Compressor {
 	case CompGzip:
-		gr, err := gzip.NewReader(bytes.NewReader(compressed))
+		// SquashFS "gzip" = zlib (not gzip with extra headers)
+		zr, err := zlib.NewReader(bytes.NewReader(compressed))
 		if err != nil {
-			return nil, err
+			// Fallback to gzip
+			gr, gerr := gzip.NewReader(bytes.NewReader(compressed))
+			if gerr != nil {
+				return nil, err
+			}
+			defer gr.Close()
+			return io.ReadAll(gr)
 		}
-		defer gr.Close()
-		return io.ReadAll(gr)
+		defer zr.Close()
+		return io.ReadAll(zr)
 	case CompXZ:
 		xr, err := xz.NewReader(bytes.NewReader(compressed))
 		if err != nil {

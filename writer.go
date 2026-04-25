@@ -2,7 +2,7 @@ package squashfs
 
 import (
 	"bytes"
-	"compress/gzip"
+	"compress/zlib"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -32,9 +32,10 @@ func (w *Writer) compress(data []byte) ([]byte, bool) {
 	var buf bytes.Buffer
 	switch w.Compressor {
 	case CompGzip:
-		gw := gzip.NewWriter(&buf)
-		gw.Write(data)
-		gw.Close()
+		// SquashFS gzip = zlib (not gzip with headers)
+		zw := zlib.NewWriter(&buf)
+		zw.Write(data)
+		zw.Close()
 	case CompXZ:
 		xw, _ := xz.NewWriter(&buf)
 		xw.Write(data)
@@ -231,12 +232,18 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		node.dirSize = uint32(dirBuf.Len()) - node.dirStart
 	}
 
-	// Phase 3: Build inode table (now we know dir offsets)
+	// Phase 3: Build inode table
+	// SquashFS convention: write children before parents (root last)
 	var inodeBuf bytes.Buffer
+	// Write non-root first
 	for _, node := range allNodes {
+		if node == root { continue }
 		node.inodeOff = inodeBuf.Len()
 		w.writeNodeInode(&inodeBuf, node)
 	}
+	// Write root last
+	root.inodeOff = inodeBuf.Len()
+	w.writeNodeInode(&inodeBuf, root)
 
 	// Patch dir entries with correct inode offsets
 	dirBytes := dirBuf.Bytes()
@@ -270,17 +277,19 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 			binary.Write(&fragData, binary.LittleEndian, fe.Size)
 			binary.Write(&fragData, binary.LittleEndian, fe.Unused)
 		}
-		metaOff := uint64(out.Len())
+		fragMetaStart := uint64(out.Len())
 		w.writeMetablocks(out, fragData.Bytes())
-		binary.Write(out, binary.LittleEndian, metaOff)
+		fragTableStart = uint64(out.Len()) // lookup table
+		binary.Write(out, binary.LittleEndian, fragMetaStart)
 	}
 
 	// Phase 5: ID table
-	idTableStart := uint64(out.Len())
-	idData := make([]byte, 4)
-	metaOff := uint64(out.Len())
+	// Format: metablock(s) containing uint32 IDs, then lookup table of uint64 pointers
+	idData := make([]byte, 4) // single ID = 0 (root)
+	idMetaStart := uint64(out.Len())
 	w.writeMetablocks(out, idData)
-	binary.Write(out, binary.LittleEndian, metaOff)
+	idTableStart := uint64(out.Len()) // lookup table starts here
+	binary.Write(out, binary.LittleEndian, idMetaStart) // pointer to metablock
 
 	// Phase 6: Superblock
 	totalBytes := uint64(out.Len())
@@ -292,7 +301,7 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 	binary.LittleEndian.PutUint32(sb[16:], uint32(len(fragEntries)))
 	binary.LittleEndian.PutUint16(sb[20:], w.Compressor)
 	binary.LittleEndian.PutUint16(sb[22:], blockLog(w.BlockSize))
-	binary.LittleEndian.PutUint16(sb[24:], 0) // flags (no comp opts)
+	binary.LittleEndian.PutUint16(sb[24:], 0x00C0) // flags: dedup + always_frag
 	binary.LittleEndian.PutUint16(sb[26:], 1) // id count
 	binary.LittleEndian.PutUint16(sb[28:], 4) // v4.0
 	binary.LittleEndian.PutUint16(sb[30:], 0)
