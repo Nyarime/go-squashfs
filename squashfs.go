@@ -15,10 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/klauspost/compress/zstd"
-	"github.com/ulikunitz/xz"
-	"github.com/ulikunitz/xz/lzma"
 )
 
 const (
@@ -286,19 +282,21 @@ func (r *Reader) decompress(compressed []byte, maxOut int) ([]byte, error) {
 		defer zr.Close()
 		return io.ReadAll(io.LimitReader(zr, int64(maxOut)))
 	case CompXZ:
-		xr, err := xz.NewReader(bytes.NewReader(compressed))
+		xr, err := XzNewReader(bytes.NewReader(compressed))
 		if err != nil {
 			return nil, err
 		}
+		defer xr.Close()
 		return io.ReadAll(io.LimitReader(xr, int64(maxOut)))
 	case CompLZMA:
-		lr, err := lzma.NewReader(bytes.NewReader(compressed))
+		lr, err := LzmaNewReader(bytes.NewReader(compressed))
 		if err != nil {
 			return nil, err
 		}
+		defer lr.Close()
 		return io.ReadAll(io.LimitReader(lr, int64(maxOut)))
 	case CompZstd:
-		zr, err := zstd.NewReader(bytes.NewReader(compressed))
+		zr, err := ZstdNewReader(bytes.NewReader(compressed))
 		if err != nil {
 			return nil, err
 		}

@@ -13,8 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
-	"github.com/ulikunitz/xz"
 )
 
 type Writer struct {
@@ -37,13 +35,11 @@ func (w *Writer) compress(data []byte) ([]byte, bool) {
 		zw.Write(data)
 		zw.Close()
 	case CompXZ:
-		xw, _ := xz.NewWriter(&buf)
-		xw.Write(data)
-		xw.Close()
+		// XZ compression not yet self-implemented; return uncompressed
+		return data, true
 	case CompZstd:
-		zw, _ := zstd.NewWriter(&buf)
-		zw.Write(data)
-		zw.Close()
+		compressed := ZstdCompress(data, 3)
+		buf.Write(compressed)
 	default:
 		return data, true
 	}
