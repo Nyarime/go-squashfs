@@ -1,6 +1,8 @@
 // Package squashfs provides a pure Go SquashFS reader.
 // Supports gzip, xz, lzma, lz4, zstd compression.
 // Designed for firmware analysis — works on Linux, macOS, and Windows.
+// Memory-efficient: uses file-backed I/O for large images, streams file
+// extraction directly to disk instead of buffering in memory.
 package squashfs
 
 import (
@@ -40,6 +42,12 @@ const (
 	InodeExtSymlink   = 10
 
 	NoFragment = 0xFFFFFFFF
+
+	maxExtractFiles = 100000
+	maxExtractDepth = 20
+	maxPathLen      = 4096
+	// Maximum decompressed output per block (safety limit: 4x block size)
+	decompressLimit = 4
 )
 
 type Superblock struct {
@@ -82,33 +90,122 @@ type Inode struct {
 }
 
 type fragEntry struct {
-	Start    uint64
-	Size     uint32
-	Unused   uint32
+	Start  uint64
+	Size   uint32
+	Unused uint32
 }
 
-type Reader struct {
-	data      []byte
-	SB        Superblock
-	inodeData []byte // decompressed inode table
-	dirData   []byte // decompressed directory table
-	frags     []fragEntry
-	inodeMetaMap []metaMapping // compressed offset → decompressed offset
-	dirMetaMap   []metaMapping
+// dataSource abstracts reading from either a byte slice or a file.
+type dataSource interface {
+	ReadAt(p []byte, off int64) (int, error)
+	Len() int
+	// Slice returns bytes from [start:end]. For small metadata reads.
+	Slice(start, end int) ([]byte, error)
+}
+
+// byteSource wraps a []byte as a dataSource.
+type byteSource struct{ data []byte }
+
+func (b *byteSource) ReadAt(p []byte, off int64) (int, error) {
+	if int(off) >= len(b.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+func (b *byteSource) Len() int { return len(b.data) }
+func (b *byteSource) Slice(start, end int) ([]byte, error) {
+	if end > len(b.data) {
+		return nil, fmt.Errorf("slice beyond data")
+	}
+	return b.data[start:end], nil
+}
+
+// fileSource wraps an os.File as a dataSource.
+type fileSource struct {
+	f    *os.File
+	size int
+}
+
+func (f *fileSource) ReadAt(p []byte, off int64) (int, error) {
+	return f.f.ReadAt(p, off)
+}
+func (f *fileSource) Len() int { return f.size }
+func (f *fileSource) Slice(start, end int) ([]byte, error) {
+	buf := make([]byte, end-start)
+	_, err := f.f.ReadAt(buf, int64(start))
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return buf, nil
 }
 
 type metaMapping struct {
-	compOff uint64 // offset from table start (compressed stream)
-	decOff  uint64 // offset in decompressed data
+	compOff uint64
+	decOff  uint64
+}
+
+type Reader struct {
+	src          dataSource
+	srcFile      *os.File // non-nil if we opened the file (for Close)
+	SB           Superblock
+	inodeData    []byte // decompressed inode table
+	dirData      []byte // decompressed directory table
+	frags        []fragEntry
+	inodeMetaMap []metaMapping
+	dirMetaMap   []metaMapping
 }
 
 // NewReader creates a SquashFS reader from raw bytes.
 func NewReader(data []byte) (*Reader, error) {
-	if len(data) < 96 {
+	return newReader(&byteSource{data: data})
+}
+
+// OpenFile opens a SquashFS from a file path.
+// Uses file-backed I/O to avoid loading the entire image into memory.
+func OpenFile(path string) (*Reader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	r, err := newReader(&fileSource{f: f, size: int(fi.Size())})
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	r.srcFile = f
+	return r, nil
+}
+
+// Close releases resources. Safe to call multiple times.
+func (r *Reader) Close() error {
+	if r.srcFile != nil {
+		err := r.srcFile.Close()
+		r.srcFile = nil
+		return err
+	}
+	return nil
+}
+
+func newReader(src dataSource) (*Reader, error) {
+	if src.Len() < 96 {
 		return nil, fmt.Errorf("squashfs: too short")
 	}
-	r := &Reader{data: data}
-	d := data
+	hdr, err := src.Slice(0, 96)
+	if err != nil {
+		return nil, err
+	}
+
+	r := &Reader{src: src}
+	d := hdr
 	r.SB.Magic = le32(d[0:])
 	if r.SB.Magic != Magic {
 		return nil, fmt.Errorf("squashfs: bad magic 0x%08X", r.SB.Magic)
@@ -132,8 +229,7 @@ func NewReader(data []byte) (*Reader, error) {
 	r.SB.FragTableStart = le64(d[80:])
 	r.SB.LookupTableStart = le64(d[88:])
 
-	// Pre-read inode and directory tables
-	var err error
+	// Pre-read inode and directory metadata tables (small, always fits in memory)
 	r.inodeData, r.inodeMetaMap, err = r.readMetaRange(r.SB.InodeTableStart, r.SB.DirTableStart)
 	if err != nil {
 		return nil, fmt.Errorf("inode table: %w", err)
@@ -143,25 +239,14 @@ func NewReader(data []byte) (*Reader, error) {
 		return nil, fmt.Errorf("dir table: %w", err)
 	}
 
-	// Read fragment table
 	if r.SB.FragmentCount > 0 {
 		r.frags, err = r.readFragTable()
 		if err != nil {
-			// Non-fatal: some files may not extract
 			r.frags = nil
 		}
 	}
 
 	return r, nil
-}
-
-// OpenFile opens a SquashFS from a file path.
-func OpenFile(path string) (*Reader, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return NewReader(data)
 }
 
 func (r *Reader) CompressorName() string {
@@ -178,63 +263,86 @@ func (r *Reader) String() string {
 		r.SB.BlockSize, r.SB.InodeCount, r.SB.BytesUsed)
 }
 
-// Decompress decompresses data using the filesystem's compressor.
-func (r *Reader) Decompress(compressed []byte) ([]byte, error) {
+// decompress decompresses data using the filesystem's compressor.
+// Output is limited to maxOut bytes to prevent memory bombs.
+func (r *Reader) decompress(compressed []byte, maxOut int) ([]byte, error) {
+	if maxOut <= 0 {
+		maxOut = int(r.SB.BlockSize) * decompressLimit
+	}
+	lr := io.LimitReader(nil, int64(maxOut))
+	_ = lr // we'll use LimitedReader below
+
 	switch r.SB.Compressor {
 	case CompGzip:
-		// SquashFS "gzip" = zlib (not gzip with extra headers)
 		zr, err := zlib.NewReader(bytes.NewReader(compressed))
 		if err != nil {
-			// Fallback to gzip
 			gr, gerr := gzip.NewReader(bytes.NewReader(compressed))
 			if gerr != nil {
 				return nil, err
 			}
 			defer gr.Close()
-			return io.ReadAll(gr)
+			return io.ReadAll(io.LimitReader(gr, int64(maxOut)))
 		}
 		defer zr.Close()
-		return io.ReadAll(zr)
+		return io.ReadAll(io.LimitReader(zr, int64(maxOut)))
 	case CompXZ:
 		xr, err := xz.NewReader(bytes.NewReader(compressed))
 		if err != nil {
 			return nil, err
 		}
-		return io.ReadAll(xr)
+		return io.ReadAll(io.LimitReader(xr, int64(maxOut)))
 	case CompLZMA:
 		lr, err := lzma.NewReader(bytes.NewReader(compressed))
 		if err != nil {
 			return nil, err
 		}
-		return io.ReadAll(lr)
+		return io.ReadAll(io.LimitReader(lr, int64(maxOut)))
 	case CompZstd:
 		zr, err := zstd.NewReader(bytes.NewReader(compressed))
 		if err != nil {
 			return nil, err
 		}
 		defer zr.Close()
-		return io.ReadAll(zr)
+		return io.ReadAll(io.LimitReader(zr, int64(maxOut)))
 	default:
 		return nil, fmt.Errorf("unsupported: %s", r.CompressorName())
 	}
 }
 
+// Decompress is the public API (backward compat). No output limit.
+func (r *Reader) Decompress(compressed []byte) ([]byte, error) {
+	return r.decompress(compressed, 0)
+}
+
+// readSlice reads bytes from the source at [start:end].
+func (r *Reader) readSlice(start, end int) ([]byte, error) {
+	return r.src.Slice(start, end)
+}
+
 func (r *Reader) readMetablock(offset uint64) ([]byte, uint64, error) {
-	if int(offset)+2 > len(r.data) {
+	if int(offset)+2 > r.src.Len() {
 		return nil, 0, fmt.Errorf("metablock @0x%X beyond data", offset)
 	}
-	header := le16(r.data[offset:])
+	hdrBuf, err := r.readSlice(int(offset), int(offset)+2)
+	if err != nil {
+		return nil, 0, err
+	}
+	header := le16(hdrBuf)
 	uncomp := header&0x8000 != 0
 	size := int(header & 0x7FFF)
 	end := int(offset) + 2 + size
-	if end > len(r.data) {
+	if end > r.src.Len() {
 		return nil, 0, fmt.Errorf("metablock data beyond file")
 	}
-	raw := r.data[offset+2 : uint64(end)]
+	raw, err := r.readSlice(int(offset)+2, end)
+	if err != nil {
+		return nil, 0, err
+	}
 	if uncomp {
 		return raw, uint64(size) + 2, nil
 	}
-	dec, err := r.Decompress(raw)
+	// Metadata blocks decompress to max 8192 bytes
+	dec, err := r.decompress(raw, 8192)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -260,17 +368,19 @@ func (r *Reader) readMetaRange(start, end uint64) ([]byte, []metaMapping, error)
 }
 
 func (r *Reader) readFragTable() ([]fragEntry, error) {
-	// Fragment table is a lookup table: array of uint64 metablock pointers
-	// at FragTableStart. Number of entries = ceil(FragmentCount / 512) pointers.
 	nPtrs := (int(r.SB.FragmentCount) + 511) / 512
 	ptrOff := int(r.SB.FragTableStart)
-	if ptrOff+nPtrs*8 > len(r.data) {
+	if ptrOff+nPtrs*8 > r.src.Len() {
 		return nil, fmt.Errorf("frag table pointers beyond data")
+	}
+	ptrData, err := r.readSlice(ptrOff, ptrOff+nPtrs*8)
+	if err != nil {
+		return nil, err
 	}
 
 	var allFragData []byte
 	for i := 0; i < nPtrs; i++ {
-		ptr := le64(r.data[ptrOff+i*8:])
+		ptr := le64(ptrData[i*8:])
 		block, _, err := r.readMetablock(ptr)
 		if err != nil {
 			return nil, err
@@ -290,7 +400,6 @@ func (r *Reader) readFragTable() ([]fragEntry, error) {
 	return frags, nil
 }
 
-// readInode reads an inode from a reference (block_off << 16 | byte_off)
 func (r *Reader) readInode(ref uint64) (Inode, error) {
 	blockOff := uint32(ref >> 16)
 	byteOff := uint16(ref & 0xFFFF)
@@ -305,7 +414,6 @@ func (r *Reader) readInode(ref uint64) (Inode, error) {
 	var in Inode
 	in.Type = le16(d[0:])
 	in.Perm = le16(d[2:])
-	// uid/gid idx at 4,6
 	in.ModTime = le32(d[8:])
 	in.Number = le32(d[12:])
 
@@ -318,7 +426,6 @@ func (r *Reader) readInode(ref uint64) (Inode, error) {
 		in.Nlinks = le32(d[20:])
 		in.DirSize = uint32(le16(d[24:])) + 3
 		in.DirOffset = le16(d[26:])
-		// parent at d[28:]
 
 	case InodeExtDir:
 		if pos+40 > len(r.inodeData) {
@@ -327,8 +434,6 @@ func (r *Reader) readInode(ref uint64) (Inode, error) {
 		in.Nlinks = le32(d[16:])
 		in.DirSize = le32(d[20:]) + 3
 		in.DirStart = le32(d[24:])
-		// parent at d[28:]
-		// index_count at d[32:]
 		in.DirOffset = le16(d[34:])
 
 	case InodeBasicFile:
@@ -339,7 +444,6 @@ func (r *Reader) readInode(ref uint64) (Inode, error) {
 		in.FragIndex = le32(d[20:])
 		in.FragOffset = le32(d[24:])
 		in.FileSize = uint64(le32(d[28:]))
-		// Block sizes follow
 		nBlocks := int(in.FileSize) / int(r.SB.BlockSize)
 		if in.FragIndex == NoFragment && in.FileSize%uint64(r.SB.BlockSize) != 0 {
 			nBlocks++
@@ -351,16 +455,14 @@ func (r *Reader) readInode(ref uint64) (Inode, error) {
 		}
 
 	case InodeExtFile:
-		if pos+40 > len(r.inodeData) {
+		if pos+56 > len(r.inodeData) {
 			return in, fmt.Errorf("ext file inode too short")
 		}
 		in.StartBlock = le64(d[16:])
 		in.FileSize = le64(d[24:])
-		// sparse at d[32:]
 		in.Nlinks = le32(d[40:])
 		in.FragIndex = le32(d[44:])
 		in.FragOffset = le32(d[48:])
-		// xattr at d[52:]
 		nBlocks := int(in.FileSize) / int(r.SB.BlockSize)
 		if in.FragIndex == NoFragment && in.FileSize%uint64(r.SB.BlockSize) != 0 {
 			nBlocks++
@@ -385,15 +487,13 @@ func (r *Reader) readInode(ref uint64) (Inode, error) {
 	return in, nil
 }
 
-// metaToDecOffset maps a compressed byte offset to decompressed offset using the pre-built map
 func (r *Reader) resolveInodeRef(blockOff uint32) uint64 {
-	// blockOff is byte offset from InodeTableStart to the metablock
 	for i := len(r.inodeMetaMap) - 1; i >= 0; i-- {
 		if uint64(blockOff) >= r.inodeMetaMap[i].compOff {
 			return r.inodeMetaMap[i].decOff
 		}
 	}
-	return uint64(blockOff) // fallback
+	return uint64(blockOff)
 }
 
 func (r *Reader) resolveDirRef(blockOff uint32) uint64 {
@@ -405,7 +505,13 @@ func (r *Reader) resolveDirRef(blockOff uint32) uint64 {
 	return uint64(blockOff)
 }
 
-// readDirEntries reads directory entries from dirData
+type dirEntry struct {
+	Name     string
+	InodeRef uint64
+	InodeNum uint32
+	Type     uint16
+}
+
 func (r *Reader) readDirEntries(in Inode) ([]dirEntry, error) {
 	decStart := r.resolveDirRef(in.DirStart)
 	start := int(decStart) + int(in.DirOffset)
@@ -442,9 +548,7 @@ func (r *Reader) readDirEntries(in Inode) ([]dirEntry, error) {
 			name := string(r.dirData[off : off+nameLen])
 			off += nameLen
 
-			// Build inode reference
 			inodeRef := (uint64(blockStart) << 16) | uint64(entOffset)
-
 			entries = append(entries, dirEntry{
 				Name:     name,
 				InodeRef: inodeRef,
@@ -454,13 +558,6 @@ func (r *Reader) readDirEntries(in Inode) ([]dirEntry, error) {
 		}
 	}
 	return entries, nil
-}
-
-type dirEntry struct {
-	Name     string
-	InodeRef uint64
-	InodeNum uint32
-	Type     uint16
 }
 
 // ExtractTo extracts the entire filesystem to outDir.
@@ -473,21 +570,30 @@ func (r *Reader) ExtractTo(outDir string) (int, error) {
 	}
 
 	count := 0
-	visited := make(map[uint64]bool) // inode ref dedup
-	err = r.extractDir(outDir, rootInode, &count, 0, visited)
+	seen := make(map[uint32]bool) // inode dedup
+	err = r.extractDir(outDir, rootInode, &count, 0, seen)
 	return count, err
 }
 
-func (r *Reader) extractDir(path string, in Inode, count *int, depth int, visited map[uint64]bool) error {
-	if depth > 15 {
+func (r *Reader) extractDir(path string, in Inode, count *int, depth int, seen map[uint32]bool) error {
+	if depth > maxExtractDepth {
 		return nil
 	}
-	if *count > 100000 {
-		return fmt.Errorf("extraction limit reached (100000 files) - possible circular reference")
-	}
-	if len(path) > 4096 {
+	if *count > maxExtractFiles {
 		return nil
 	}
+	if len(path) > maxPathLen {
+		return nil
+	}
+
+	// Dedup by inode number — prevents recursive symlink-like structures
+	if in.Number > 0 {
+		if seen[in.Number] {
+			return nil
+		}
+		seen[in.Number] = true
+	}
+
 	os.MkdirAll(path, 0755)
 
 	entries, err := r.readDirEntries(in)
@@ -499,14 +605,14 @@ func (r *Reader) extractDir(path string, in Inode, count *int, depth int, visite
 		if e.Name == "." || e.Name == ".." {
 			continue
 		}
-
-		// CRITICAL: inode dedup — prevent infinite recursion from bad cross-refs
-		if visited[e.InodeRef] {
+		// Security: reject path traversal
+		if strings.Contains(e.Name, "/") || strings.Contains(e.Name, "..") {
 			continue
 		}
-		visited[e.InodeRef] = true
-
 		fullPath := filepath.Join(path, e.Name)
+		if len(fullPath) > maxPathLen {
+			continue
+		}
 
 		childInode, err := r.readInode(e.InodeRef)
 		if err != nil {
@@ -515,58 +621,147 @@ func (r *Reader) extractDir(path string, in Inode, count *int, depth int, visite
 
 		switch childInode.Type {
 		case InodeBasicDir, InodeExtDir:
-			r.extractDir(fullPath, childInode, count, depth+1, visited)
+			r.extractDir(fullPath, childInode, count, depth+1, seen)
 
 		case InodeBasicFile, InodeExtFile:
-			data, err := r.readFileData(childInode)
-			if err != nil {
+			if *count >= maxExtractFiles {
+				return nil
+			}
+			if err := r.extractFileToPath(childInode, fullPath); err != nil {
 				continue
 			}
-			os.WriteFile(fullPath, data, os.FileMode(childInode.Perm))
 			*count++
 
 		case InodeBasicSymlink, InodeExtSymlink:
 			if childInode.SymTarget != "" {
+				// Security: only create symlink, never follow
 				os.Symlink(childInode.SymTarget, fullPath)
 				*count++
 			}
-
-		default:
-			// block/char/fifo/socket — skip
 		}
 	}
 	return nil
 }
 
-// readFileData reads file content from data blocks + fragment
+// extractFileToPath streams file data block-by-block directly to disk.
+// This avoids holding the entire decompressed file in memory.
+func (r *Reader) extractFileToPath(in Inode, outPath string) error {
+	if in.FileSize == 0 {
+		return os.WriteFile(outPath, nil, os.FileMode(in.Perm))
+	}
+
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(in.Perm))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	blockStart := in.StartBlock
+	written := uint64(0)
+
+	// Write data blocks
+	for _, bs := range in.BlockSizes {
+		uncompressed := bs&(1<<24) != 0
+		size := bs & 0x00FFFFFF
+		if size == 0 {
+			// Sparse block — write zeros
+			zeros := make([]byte, r.SB.BlockSize)
+			n, _ := f.Write(zeros)
+			written += uint64(n)
+			continue
+		}
+
+		end := blockStart + uint64(size)
+		if int(end) > r.src.Len() {
+			break
+		}
+
+		raw, err := r.readSlice(int(blockStart), int(end))
+		if err != nil {
+			break
+		}
+
+		if uncompressed {
+			n, _ := f.Write(raw)
+			written += uint64(n)
+		} else {
+			dec, err := r.decompress(raw, int(r.SB.BlockSize)*decompressLimit)
+			if err != nil {
+				return fmt.Errorf("data block @0x%X: %w", blockStart, err)
+			}
+			n, _ := f.Write(dec)
+			written += uint64(n)
+		}
+		blockStart += uint64(size)
+	}
+
+	// Fragment
+	if in.FragIndex != NoFragment && int(in.FragIndex) < len(r.frags) {
+		frag := r.frags[in.FragIndex]
+		fragUncomp := frag.Size&(1<<24) != 0
+		fragSize := frag.Size & 0x00FFFFFF
+
+		end := frag.Start + uint64(fragSize)
+		if int(end) <= r.src.Len() {
+			raw, err := r.readSlice(int(frag.Start), int(end))
+			if err == nil {
+				var fragData []byte
+				if fragUncomp {
+					fragData = raw
+				} else {
+					fragData, err = r.decompress(raw, int(r.SB.BlockSize)*decompressLimit)
+					if err != nil {
+						return nil // skip fragment on error
+					}
+				}
+
+				fragOff := int(in.FragOffset)
+				remaining := int(in.FileSize) - int(written)
+				if remaining > 0 && fragOff+remaining <= len(fragData) {
+					f.Write(fragData[fragOff : fragOff+remaining])
+				} else if remaining > 0 && fragOff < len(fragData) {
+					f.Write(fragData[fragOff:])
+				}
+			}
+		}
+	}
+
+	// Truncate to exact size
+	f.Truncate(int64(in.FileSize))
+	return nil
+}
+
+// readFileData reads file content into memory. Use extractFileToPath for large files.
 func (r *Reader) readFileData(in Inode) ([]byte, error) {
 	if in.FileSize == 0 {
 		return nil, nil
 	}
 
-	var result []byte
+	result := make([]byte, 0, in.FileSize)
 	blockStart := in.StartBlock
 
-	// Read full data blocks
 	for _, bs := range in.BlockSizes {
 		uncompressed := bs&(1<<24) != 0
 		size := bs & 0x00FFFFFF
 		if size == 0 {
-			// Sparse block
 			result = append(result, make([]byte, r.SB.BlockSize)...)
 			continue
 		}
 
 		end := blockStart + uint64(size)
-		if int(end) > len(r.data) {
+		if int(end) > r.src.Len() {
 			break
 		}
 
-		raw := r.data[blockStart:end]
+		raw, err := r.readSlice(int(blockStart), int(end))
+		if err != nil {
+			break
+		}
+
 		if uncompressed {
 			result = append(result, raw...)
 		} else {
-			dec, err := r.Decompress(raw)
+			dec, err := r.decompress(raw, int(r.SB.BlockSize)*decompressLimit)
 			if err != nil {
 				return nil, fmt.Errorf("data block @0x%X: %w", blockStart, err)
 			}
@@ -575,42 +770,40 @@ func (r *Reader) readFileData(in Inode) ([]byte, error) {
 		blockStart += uint64(size)
 	}
 
-	// Read fragment if present
+	// Fragment
 	if in.FragIndex != NoFragment && int(in.FragIndex) < len(r.frags) {
 		frag := r.frags[in.FragIndex]
 		fragUncomp := frag.Size&(1<<24) != 0
 		fragSize := frag.Size & 0x00FFFFFF
 
 		end := frag.Start + uint64(fragSize)
-		if int(end) <= len(r.data) {
-			raw := r.data[frag.Start:end]
-			var fragData []byte
-			if fragUncomp {
-				fragData = raw
-			} else {
-				var err error
-				fragData, err = r.Decompress(raw)
-				if err != nil {
-					return result, nil // skip fragment on error
+		if int(end) <= r.src.Len() {
+			raw, err := r.readSlice(int(frag.Start), int(end))
+			if err == nil {
+				var fragData []byte
+				if fragUncomp {
+					fragData = raw
+				} else {
+					fragData, err = r.decompress(raw, int(r.SB.BlockSize)*decompressLimit)
+					if err != nil {
+						return result, nil
+					}
 				}
-			}
 
-			// Extract our portion from the fragment block
-			fragOff := int(in.FragOffset)
-			remaining := int(in.FileSize) - len(result)
-			if fragOff+remaining <= len(fragData) {
-				result = append(result, fragData[fragOff:fragOff+remaining]...)
-			} else if fragOff < len(fragData) {
-				result = append(result, fragData[fragOff:]...)
+				fragOff := int(in.FragOffset)
+				remaining := int(in.FileSize) - len(result)
+				if fragOff+remaining <= len(fragData) {
+					result = append(result, fragData[fragOff:fragOff+remaining]...)
+				} else if fragOff < len(fragData) {
+					result = append(result, fragData[fragOff:]...)
+				}
 			}
 		}
 	}
 
-	// Trim to exact file size
 	if uint64(len(result)) > in.FileSize {
 		result = result[:in.FileSize]
 	}
-
 	return result, nil
 }
 
@@ -660,5 +853,4 @@ func min(a, b int) int {
 	return b
 }
 
-// Ensure strings import is used
 var _ = strings.TrimSpace
