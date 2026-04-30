@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -100,11 +99,8 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 	root := &wNode{path: srcDir, relPath: "", isDir: true, mode: 0755, modTime: uint32(time.Now().Unix())}
 	// Get root stat for UID/GID
 	if fi, err := os.Lstat(srcDir); err == nil {
-		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-			root.uid = stat.Uid
-			root.gid = stat.Gid
-			root.mode = uint32(fi.Mode().Perm())
-		}
+		root.uid, root.gid = getStatUID(fi.Sys())
+		root.mode = uint32(fi.Mode().Perm())
 	}
 	root.xattrs = readXattrs(srcDir)
 
@@ -143,17 +139,16 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		}
 
 		// Get UID/GID from stat
-		if stat, ok := linfo.Sys().(*syscall.Stat_t); ok {
-			node.uid = stat.Uid
-			node.gid = stat.Gid
+		{ uid, gid := getStatUID(linfo.Sys())
+			node.uid = uid
+			node.gid = gid
 			idSet[node.uid] = true
 			idSet[node.gid] = true
 
 			// Check for device nodes
 			if linfo.Mode()&os.ModeDevice != 0 {
 				node.isDev = true
-				node.devMajor = uint32(stat.Rdev >> 8 & 0xff)
-				node.devMinor = uint32(stat.Rdev & 0xff)
+				node.devMajor, node.devMinor = getDevMajorMinor(linfo.Sys())
 				node.fileSize = 0
 			}
 		}
@@ -570,40 +565,6 @@ func blockLog(blockSize uint32) uint16 {
 }
 
 // readXattrs reads extended attributes from a file path.
-func readXattrs(path string) map[string][]byte {
-	// List xattrs
-	sz, err := syscall.Listxattr(path, nil)
-	if err != nil || sz <= 0 {
-		return nil
-	}
-	buf := make([]byte, sz)
-	sz, err = syscall.Listxattr(path, buf)
-	if err != nil || sz <= 0 {
-		return nil
-	}
-
-	result := map[string][]byte{}
-	names := strings.Split(strings.TrimRight(string(buf[:sz]), "\x00"), "\x00")
-	for _, name := range names {
-		if name == "" {
-			continue
-		}
-		vsz, err := syscall.Getxattr(path, name, nil)
-		if err != nil || vsz < 0 {
-			continue
-		}
-		val := make([]byte, vsz)
-		vsz, err = syscall.Getxattr(path, name, val)
-		if err != nil {
-			continue
-		}
-		result[name] = val[:vsz]
-	}
-	if len(result) == 0 {
-		return nil
-	}
-	return result
-}
 
 // xattrTypeFromKey returns the SquashFS xattr type prefix ID.
 func xattrTypeFromKey(key string) uint16 {
