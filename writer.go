@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
-
 )
 
 type Writer struct {
@@ -30,15 +30,18 @@ func (w *Writer) compress(data []byte) ([]byte, bool) {
 	var buf bytes.Buffer
 	switch w.Compressor {
 	case CompGzip:
-		// SquashFS gzip = zlib (not gzip with headers)
 		zw := zlib.NewWriter(&buf)
 		zw.Write(data)
 		zw.Close()
 	case CompXZ:
-		// XZ compression not yet self-implemented; return uncompressed
-		return data, true
+		compressed := XzCompress(data)
+		buf.Write(compressed)
 	case CompZstd:
 		compressed := ZstdCompress(data, 3)
+		// Validate roundtrip — pure-Go compressor can produce invalid output for some inputs
+		if dec, err := ZstdDecompress(compressed); err != nil || len(dec) != len(data) {
+			return data, true
+		}
 		buf.Write(compressed)
 	default:
 		return data, true
@@ -54,21 +57,29 @@ type wNode struct {
 	relPath  string
 	isDir    bool
 	isLink   bool
+	isDev    bool
 	target   string
 	fileSize int64
 	mode     uint32
 	modTime  uint32
+	uid      uint32
+	gid      uint32
+	devMajor uint32
+	devMinor uint32
 	children []*wNode
 	parent   *wNode
+	xattrs   map[string][]byte
 	// Write state
 	inodeNum   uint32
-	inodeOff   int    // byte offset in inode table (decompressed)
-	startBlock uint64 // data block start in output
+	inodeOff   int
+	startBlock uint64
 	blockSizes []uint32
 	fragIdx    uint32
 	fragOff    uint32
-	// Dir info (set after dir table built)
-	dirStart uint32 // byte offset in dir table (decompressed)
+	uidIdx     uint16
+	gidIdx     uint16
+	// Dir info
+	dirStart uint32
 	dirSize  uint32
 }
 
@@ -77,10 +88,26 @@ func (n *wNode) baseName() string {
 	return parts[len(parts)-1]
 }
 
+// xattrEntry stores a key-value pair for the xattr table.
+type xattrEntry struct {
+	key   string
+	value []byte
+}
+
 // CreateFromDir creates a SquashFS image from a directory (pure Go).
 func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 	// Phase 0: Build tree
 	root := &wNode{path: srcDir, relPath: "", isDir: true, mode: 0755, modTime: uint32(time.Now().Unix())}
+	// Get root stat for UID/GID
+	if fi, err := os.Lstat(srcDir); err == nil {
+		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+			root.uid = stat.Uid
+			root.gid = stat.Gid
+			root.mode = uint32(fi.Mode().Perm())
+		}
+	}
+	root.xattrs = readXattrs(srcDir)
+
 	nodeMap := map[string]*wNode{"": root}
 	inodeNum := uint32(1)
 	root.inodeNum = inodeNum
@@ -89,6 +116,9 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 	var allNodes []*wNode
 	allNodes = append(allNodes, root)
 
+	// Collect unique UID/GID values
+	idSet := map[uint32]bool{root.uid: true, root.gid: true}
+
 	filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || path == srcDir {
 			return nil
@@ -96,21 +126,46 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		rel, _ := filepath.Rel(srcDir, path)
 		rel = filepath.ToSlash(rel)
 
+		// Use Lstat to detect symlinks
+		linfo, lerr := os.Lstat(path)
+		if lerr != nil {
+			return nil
+		}
+
 		node := &wNode{
 			path:     path,
 			relPath:  rel,
-			isDir:    info.IsDir(),
-			fileSize: info.Size(),
-			mode:     uint32(info.Mode().Perm()),
-			modTime:  uint32(info.ModTime().Unix()),
+			isDir:    linfo.IsDir(),
+			fileSize: linfo.Size(),
+			mode:     uint32(linfo.Mode().Perm()),
+			modTime:  uint32(linfo.ModTime().Unix()),
 			fragIdx:  NoFragment,
 		}
 
-		if info.Mode()&os.ModeSymlink != 0 {
+		// Get UID/GID from stat
+		if stat, ok := linfo.Sys().(*syscall.Stat_t); ok {
+			node.uid = stat.Uid
+			node.gid = stat.Gid
+			idSet[node.uid] = true
+			idSet[node.gid] = true
+
+			// Check for device nodes
+			if linfo.Mode()&os.ModeDevice != 0 {
+				node.isDev = true
+				node.devMajor = uint32(stat.Rdev >> 8 & 0xff)
+				node.devMinor = uint32(stat.Rdev & 0xff)
+				node.fileSize = 0
+			}
+		}
+
+		if linfo.Mode()&os.ModeSymlink != 0 {
 			node.isLink = true
 			node.target, _ = os.Readlink(path)
 			node.fileSize = 0
 		}
+
+		// Read xattrs
+		node.xattrs = readXattrs(path)
 
 		inodeNum++
 		node.inodeNum = inodeNum
@@ -130,6 +185,22 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		return nil
 	})
 
+	// Build sorted ID table
+	var idList []uint32
+	for id := range idSet {
+		idList = append(idList, id)
+	}
+	sort.Slice(idList, func(i, j int) bool { return idList[i] < idList[j] })
+	idIndex := map[uint32]uint16{}
+	for i, id := range idList {
+		idIndex[id] = uint16(i)
+	}
+	// Assign UID/GID indices
+	for _, node := range allNodes {
+		node.uidIdx = idIndex[node.uid]
+		node.gidIdx = idIndex[node.gid]
+	}
+
 	// Sort children
 	for _, n := range allNodes {
 		sort.Slice(n.children, func(i, j int) bool {
@@ -140,13 +211,20 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 	out := &bytes.Buffer{}
 	out.Write(make([]byte, 96)) // superblock placeholder
 
-	// Phase 1: Write data blocks + fragments
+	// Phase 1: Write data blocks + fragments with deduplication
 	var fragBuf bytes.Buffer
 	var fragEntries []fragEntry
 	bs := int(w.BlockSize)
 
+	// Fragment dedup: hash → fragIdx
+	type fragRef struct {
+		idx uint32
+		off uint32
+	}
+	fragDedup := map[string]fragRef{}
+
 	for _, node := range allNodes {
-		if node.isDir || node.isLink || node.fileSize == 0 {
+		if node.isDir || node.isLink || node.isDev || node.fileSize == 0 {
 			continue
 		}
 		data, err := os.ReadFile(node.path)
@@ -170,20 +248,31 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		}
 
 		if remainder > 0 {
-			node.fragOff = uint32(fragBuf.Len())
-			node.fragIdx = uint32(len(fragEntries))
-			fragBuf.Write(data[fullBlocks*bs:])
+			fragData := data[fullBlocks*bs:]
+			fragKey := string(fragData)
 
-			if fragBuf.Len() >= bs {
-				fStart := uint64(out.Len())
-				comp, isUncomp := w.compress(fragBuf.Bytes())
-				fSize := uint32(len(comp))
-				if isUncomp {
-					fSize |= 1 << 24
+			if ref, ok := fragDedup[fragKey]; ok {
+				// Reuse existing fragment
+				node.fragIdx = ref.idx
+				node.fragOff = ref.off
+			} else {
+				node.fragOff = uint32(fragBuf.Len())
+				node.fragIdx = uint32(len(fragEntries))
+				fragDedup[fragKey] = fragRef{idx: node.fragIdx, off: node.fragOff}
+				fragBuf.Write(fragData)
+
+				if fragBuf.Len() >= bs {
+					fStart := uint64(out.Len())
+					comp, isUncomp := w.compress(fragBuf.Bytes())
+					fSize := uint32(len(comp))
+					if isUncomp {
+						fSize |= 1 << 24
+					}
+					fragEntries = append(fragEntries, fragEntry{Start: fStart, Size: fSize})
+					out.Write(comp)
+					fragBuf.Reset()
+					fragDedup = map[string]fragRef{} // reset dedup map for new fragment block
 				}
-				fragEntries = append(fragEntries, fragEntry{Start: fStart, Size: fSize})
-				out.Write(comp)
-				fragBuf.Reset()
 			}
 		}
 	}
@@ -199,7 +288,56 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		out.Write(comp)
 	}
 
-	// Phase 2: Build directory table
+	// Phase 2: Build xattr table
+	// Collect all xattrs, assign indices
+	type xattrRef struct {
+		offset uint32 // byte offset into xattr value data
+	}
+	var xattrValueBuf bytes.Buffer
+	var xattrIdTable []uint64 // offset into xattr metadata for each inode's xattr set
+	nodeXattrIdx := map[uint32]uint32{} // inodeNum → xattr index
+
+	hasXattrs := false
+	for _, node := range allNodes {
+		if len(node.xattrs) > 0 {
+			hasXattrs = true
+			break
+		}
+	}
+
+	if hasXattrs {
+		for _, node := range allNodes {
+			if len(node.xattrs) == 0 {
+				continue
+			}
+			nodeXattrIdx[node.inodeNum] = uint32(len(xattrIdTable))
+
+			// Write key-value pairs
+			offset := uint64(xattrValueBuf.Len())
+			xattrIdTable = append(xattrIdTable, offset)
+
+			// Sort keys for determinism
+			var keys []string
+			for k := range node.xattrs {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+
+			for _, k := range keys {
+				v := node.xattrs[k]
+				// Xattr entry: type(2) + name_size(2) + name + value_size(4) + value
+				xattrType := xattrTypeFromKey(k)
+				name := xattrStripPrefix(k)
+				binary.Write(&xattrValueBuf, binary.LittleEndian, uint16(xattrType))
+				binary.Write(&xattrValueBuf, binary.LittleEndian, uint16(len(name)))
+				xattrValueBuf.WriteString(name)
+				binary.Write(&xattrValueBuf, binary.LittleEndian, uint32(len(v)))
+				xattrValueBuf.Write(v)
+			}
+		}
+	}
+
+	// Phase 3: Build directory table
 	var dirBuf bytes.Buffer
 	for _, node := range allNodes {
 		if !node.isDir || len(node.children) == 0 {
@@ -207,18 +345,20 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		}
 		node.dirStart = uint32(dirBuf.Len())
 
-		binary.Write(&dirBuf, binary.LittleEndian, uint32(len(node.children)-1)) // count
-		binary.Write(&dirBuf, binary.LittleEndian, uint32(0))                     // inode block (byte offset, set to 0 = first metablock)
-		binary.Write(&dirBuf, binary.LittleEndian, node.children[0].inodeNum)     // base inode
+		binary.Write(&dirBuf, binary.LittleEndian, uint32(len(node.children)-1))
+		binary.Write(&dirBuf, binary.LittleEndian, uint32(0))
+		binary.Write(&dirBuf, binary.LittleEndian, node.children[0].inodeNum)
 
 		for _, child := range node.children {
-			binary.Write(&dirBuf, binary.LittleEndian, uint16(0)) // inode offset (set in Phase 3)
+			binary.Write(&dirBuf, binary.LittleEndian, uint16(0)) // inode offset placeholder
 			binary.Write(&dirBuf, binary.LittleEndian, int16(int32(child.inodeNum)-int32(node.children[0].inodeNum)))
 			t := uint16(InodeBasicFile)
 			if child.isDir {
 				t = InodeBasicDir
 			} else if child.isLink {
 				t = InodeBasicSymlink
+			} else if child.isDev {
+				t = InodeBasicBlock
 			}
 			binary.Write(&dirBuf, binary.LittleEndian, t)
 			name := child.baseName()
@@ -228,11 +368,10 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		node.dirSize = uint32(dirBuf.Len()) - node.dirStart
 	}
 
-	// Phase 3: Build inode table (depth-first: leaves before parents)
+	// Phase 4: Build inode table
 	var inodeBuf bytes.Buffer
 	var writeOrder func(n *wNode)
 	writeOrder = func(n *wNode) {
-		// Write children first (sorted), then self
 		for _, child := range n.children {
 			if child.isDir {
 				writeOrder(child)
@@ -241,7 +380,6 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 				w.writeNodeInode(&inodeBuf, child)
 			}
 		}
-		// Write self (directory) after all children
 		n.inodeOff = inodeBuf.Len()
 		w.writeNodeInode(&inodeBuf, n)
 	}
@@ -253,7 +391,7 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		if !node.isDir || len(node.children) == 0 {
 			continue
 		}
-		off := int(node.dirStart) + 12 // skip header
+		off := int(node.dirStart) + 12
 		for _, child := range node.children {
 			if off+2 <= len(dirBytes) {
 				binary.LittleEndian.PutUint16(dirBytes[off:], uint16(child.inodeOff))
@@ -270,7 +408,7 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 	dirTableStart := uint64(out.Len())
 	w.writeMetablocks(out, dirBytes)
 
-	// Phase 4: Fragment table
+	// Phase 5: Fragment table
 	fragTableStart := uint64(out.Len())
 	if len(fragEntries) > 0 {
 		var fragData bytes.Buffer
@@ -281,19 +419,51 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 		}
 		fragMetaStart := uint64(out.Len())
 		w.writeMetablocks(out, fragData.Bytes())
-		fragTableStart = uint64(out.Len()) // lookup table
+		fragTableStart = uint64(out.Len())
 		binary.Write(out, binary.LittleEndian, fragMetaStart)
 	}
 
-	// Phase 5: ID table
-	// Format: metablock(s) containing uint32 IDs, then lookup table of uint64 pointers
-	idData := make([]byte, 4) // single ID = 0 (root)
+	// Phase 6: Xattr table
+	xattrTableStart := uint64(0xFFFFFFFFFFFFFFFF)
+	if hasXattrs && xattrValueBuf.Len() > 0 {
+		xattrTableStart = uint64(out.Len())
+		// Xattr table: metadata blocks containing key-value data
+		xattrMetaStart := uint64(out.Len())
+		w.writeMetablocks(out, xattrValueBuf.Bytes())
+
+		// Xattr ID table: array of xattr_id entries (16 bytes each)
+		// Then lookup table of uint64 pointers
+		var idBuf bytes.Buffer
+		for _, offset := range xattrIdTable {
+			// xattr_id: xattr(8) + count(4) + size(4)
+			binary.Write(&idBuf, binary.LittleEndian, offset)
+			binary.Write(&idBuf, binary.LittleEndian, uint32(1)) // count
+			binary.Write(&idBuf, binary.LittleEndian, uint32(0)) // size (unused by most implementations)
+		}
+
+		idMetaStart := uint64(out.Len())
+		w.writeMetablocks(out, idBuf.Bytes())
+
+		// Xattr table header: xattr_meta_start(8) + xattr_id_count(4) + padding(4)
+		// Then lookup pointers
+		xattrTableStart = uint64(out.Len())
+		binary.Write(out, binary.LittleEndian, xattrMetaStart)
+		binary.Write(out, binary.LittleEndian, uint32(len(xattrIdTable)))
+		binary.Write(out, binary.LittleEndian, uint32(0)) // unused
+		binary.Write(out, binary.LittleEndian, idMetaStart)
+	}
+
+	// Phase 7: ID table
+	idData := make([]byte, len(idList)*4)
+	for i, id := range idList {
+		binary.LittleEndian.PutUint32(idData[i*4:], id)
+	}
 	idMetaStart := uint64(out.Len())
 	w.writeMetablocks(out, idData)
-	idTableStart := uint64(out.Len()) // lookup table starts here
-	binary.Write(out, binary.LittleEndian, idMetaStart) // pointer to metablock
+	idTableStart := uint64(out.Len())
+	binary.Write(out, binary.LittleEndian, idMetaStart)
 
-	// Phase 6: Superblock
+	// Phase 8: Superblock
 	totalBytes := uint64(out.Len())
 	sb := out.Bytes()[:96]
 	binary.LittleEndian.PutUint32(sb[0:], Magic)
@@ -304,13 +474,13 @@ func (w *Writer) CreateFromDir(srcDir, outputPath string) error {
 	binary.LittleEndian.PutUint16(sb[20:], w.Compressor)
 	binary.LittleEndian.PutUint16(sb[22:], blockLog(w.BlockSize))
 	binary.LittleEndian.PutUint16(sb[24:], 0x00C0) // flags: dedup + always_frag
-	binary.LittleEndian.PutUint16(sb[26:], 1) // id count
+	binary.LittleEndian.PutUint16(sb[26:], uint16(len(idList)))
 	binary.LittleEndian.PutUint16(sb[28:], 4) // v4.0
 	binary.LittleEndian.PutUint16(sb[30:], 0)
 	binary.LittleEndian.PutUint64(sb[32:], uint64(root.inodeOff)) // root inode ref
 	binary.LittleEndian.PutUint64(sb[40:], totalBytes)
 	binary.LittleEndian.PutUint64(sb[48:], idTableStart)
-	binary.LittleEndian.PutUint64(sb[56:], 0xFFFFFFFFFFFFFFFF)
+	binary.LittleEndian.PutUint64(sb[56:], xattrTableStart)
 	binary.LittleEndian.PutUint64(sb[64:], inodeTableStart)
 	binary.LittleEndian.PutUint64(sb[72:], dirTableStart)
 	binary.LittleEndian.PutUint64(sb[80:], fragTableStart)
@@ -325,29 +495,35 @@ func (w *Writer) writeNodeInode(buf *bytes.Buffer, node *wNode) {
 		t = InodeBasicDir
 	} else if node.isLink {
 		t = InodeBasicSymlink
+	} else if node.isDev {
+		t = InodeBasicBlock
 	}
 
-	// Header: type(2) + perm(2) + uid(2) + gid(2) + mtime(4) + number(4)
+	// Header: type(2) + perm(2) + uid_idx(2) + gid_idx(2) + mtime(4) + number(4)
 	binary.Write(buf, binary.LittleEndian, t)
 	binary.Write(buf, binary.LittleEndian, uint16(node.mode&0xFFF))
-	binary.Write(buf, binary.LittleEndian, uint16(0))
-	binary.Write(buf, binary.LittleEndian, uint16(0))
+	binary.Write(buf, binary.LittleEndian, node.uidIdx)
+	binary.Write(buf, binary.LittleEndian, node.gidIdx)
 	binary.Write(buf, binary.LittleEndian, node.modTime)
 	binary.Write(buf, binary.LittleEndian, node.inodeNum)
 
 	switch {
+	case node.isDev:
+		// Basic device inode: nlinks(4) + rdev(4)
+		binary.Write(buf, binary.LittleEndian, uint32(1)) // nlinks
+		rdev := (node.devMajor << 8) | node.devMinor
+		binary.Write(buf, binary.LittleEndian, rdev)
+
 	case node.isDir:
 		nlinks := uint32(len(node.children) + 2)
 		parentNum := uint32(1)
 		if node.parent != nil {
 			parentNum = node.parent.inodeNum
 		}
-		// dir_start = compressed metablock offset from DirTableStart (0 for single metablock)
-		// offset = decompressed byte offset within that metablock
-		binary.Write(buf, binary.LittleEndian, uint32(0))            // dir_start (single metablock)
+		binary.Write(buf, binary.LittleEndian, uint32(0))             // dir_start
 		binary.Write(buf, binary.LittleEndian, nlinks)
-		binary.Write(buf, binary.LittleEndian, uint16(node.dirSize)) // file_size - 3
-		binary.Write(buf, binary.LittleEndian, uint16(node.dirStart)) // offset within metablock
+		binary.Write(buf, binary.LittleEndian, uint16(node.dirSize))  // file_size - 3
+		binary.Write(buf, binary.LittleEndian, uint16(node.dirStart)) // offset
 		binary.Write(buf, binary.LittleEndian, parentNum)
 
 	case node.isLink:
@@ -391,6 +567,66 @@ func blockLog(blockSize uint32) uint16 {
 		log++
 	}
 	return log
+}
+
+// readXattrs reads extended attributes from a file path.
+func readXattrs(path string) map[string][]byte {
+	// List xattrs
+	sz, err := syscall.Listxattr(path, nil)
+	if err != nil || sz <= 0 {
+		return nil
+	}
+	buf := make([]byte, sz)
+	sz, err = syscall.Listxattr(path, buf)
+	if err != nil || sz <= 0 {
+		return nil
+	}
+
+	result := map[string][]byte{}
+	names := strings.Split(strings.TrimRight(string(buf[:sz]), "\x00"), "\x00")
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		vsz, err := syscall.Getxattr(path, name, nil)
+		if err != nil || vsz < 0 {
+			continue
+		}
+		val := make([]byte, vsz)
+		vsz, err = syscall.Getxattr(path, name, val)
+		if err != nil {
+			continue
+		}
+		result[name] = val[:vsz]
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// xattrTypeFromKey returns the SquashFS xattr type prefix ID.
+func xattrTypeFromKey(key string) uint16 {
+	switch {
+	case strings.HasPrefix(key, "user."):
+		return 0
+	case strings.HasPrefix(key, "trusted."):
+		return 1
+	case strings.HasPrefix(key, "security."):
+		return 2
+	default:
+		return 0
+	}
+}
+
+// xattrStripPrefix removes the known prefix from an xattr key.
+func xattrStripPrefix(key string) string {
+	for _, prefix := range []string{"user.", "trusted.", "security."} {
+		if strings.HasPrefix(key, prefix) {
+			return key[len(prefix):]
+		}
+	}
+	return key
 }
 
 // CreateWithMksquashfs uses external mksquashfs (recommended for production).
