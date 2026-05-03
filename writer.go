@@ -42,6 +42,18 @@ func (w *Writer) compress(data []byte) ([]byte, bool) {
 			return data, true
 		}
 		buf.Write(compressed)
+	case CompLZO:
+		compressed, err := LzoCompress(data)
+		if err != nil {
+			return data, true
+		}
+		buf.Write(compressed)
+	case CompLZ4:
+		compressed, err := Lz4BlockCompress(data)
+		if err != nil {
+			return data, true
+		}
+		buf.Write(compressed)
 	default:
 		return data, true
 	}

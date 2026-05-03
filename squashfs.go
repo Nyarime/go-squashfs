@@ -302,6 +302,20 @@ func (r *Reader) decompress(compressed []byte, maxOut int) ([]byte, error) {
 		}
 		defer zr.Close()
 		return io.ReadAll(io.LimitReader(zr, int64(maxOut)))
+	case CompLZO:
+		lr, err := LzoNewReader(bytes.NewReader(compressed))
+		if err != nil {
+			return nil, err
+		}
+		defer lr.Close()
+		return io.ReadAll(io.LimitReader(lr, int64(maxOut)))
+	case CompLZ4:
+		lr, err := Lz4NewReader(bytes.NewReader(compressed))
+		if err != nil {
+			return nil, err
+		}
+		defer lr.Close()
+		return io.ReadAll(io.LimitReader(lr, int64(maxOut)))
 	default:
 		return nil, fmt.Errorf("unsupported: %s", r.CompressorName())
 	}
